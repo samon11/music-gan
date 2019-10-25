@@ -3,3 +3,4 @@ checkpoints/
 music-data/
 __pycache__/
 .ipynb*/
+.vscode/

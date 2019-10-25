@@ -17,11 +17,12 @@ random.seed(8)
 random.shuffle(filenames)
 
 SR = 14400
-INPUT_LENGTH = 8000
+INPUT_LENGTH = 5000
 BATCH_SIZE = 1
 SOUND_DIM = 8
 EPOCHS = 50
-LATENT_DIM = 8
+LATENT_DIM = 6
+restore_latest = False
 
 
 # https://www.kaggle.com/fizzbuzz/beginner-s-guide-to-audio-data
@@ -79,7 +80,6 @@ class MultiHeadAttn(tf.keras.layers.Layer):
     def split_heads(self, x, batch_size):
         # split last dimension into (num_heads, depth)
         # transpose result to shape (batch_size, num_heads, seq_len, depth)
-        
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
         return tf.transpose(x, perm=[0, 2, 1, 3])
     
@@ -184,77 +184,116 @@ class Discriminator(tf.keras.Model):
 
         prediction = self.flatten(out3)
         return self.out(prediction)
-        
-
-cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-def d_loss(real_output, fake_output, noise_scaler=0.05):
-    def random_noise(output):
-        return noise_scaler * tf.random.uniform(output.shape)
-    
-    scale = 1 / BATCH_SIZE
-    real_loss = cross_entropy(tf.ones_like(real_output) + random_noise(real_output), real_output)
-    fake_loss = cross_entropy(tf.zeros_like(fake_output) + random_noise(fake_output), fake_output)
-    
-    # (1/M) * (cross_entropy loss)
-    total_loss = (1 / BATCH_SIZE) * (real_loss + fake_loss)
-    return total_loss
-
-def g_loss(fake_output):
-    total_loss = (1 / BATCH_SIZE) * cross_entropy(tf.ones_like(fake_output), fake_output)
-    return total_loss
 
 
-d_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='dis_loss')
-g_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='gen_loss')
-@tf.function
-def train_step(generator, discriminator, audio, latent_dim=8, sgd_rate=32):
-    noise = tf.random.normal([audio.shape[0], latent_dim])
-    
-    with tf.GradientTape() as gen_tape, tf.GradientTape() as dis_tape:
-        generated_audio = generator(noise, training=True)
-        
-        real_output = discriminator(audio, training=True)
-        fake_output = discriminator(generated_audio, training=True)
-        
-        dis_loss = d_loss(real_output, fake_output)
-        gen_loss = g_loss(fake_output)
-        
-        d_metric_loss(real_output, fake_output)
-        g_metric_loss(tf.ones_like(real_output), fake_output)
-    
-    # apply gradient update stochastically
-    # 1 / sgd_rate chance randint returns 0
-    if random.randint(0, sgd_rate) == 0:
-        dis_grads = dis_tape.gradient(dis_loss, discriminator.trainable_variables)
-        gen_grads = gen_tape.gradient(gen_loss, generator.trainable_variables)
-        dis_opt.apply_gradients(zip(dis_grads, discriminator.trainable_variables))
-        gen_opt.apply_gradients(zip(gen_grads, generator.trainable_variables))
-        
+class MusicGAN:
+    def __init__(self, input_length, d_model, dropout=0.1, d_noise=0.05, g_lr=1e-4, d_lr=1e-5, train=False):
+        self.input_length = input_length
+        self.d_model = d_model
+        self.d_noise = d_noise
+
+        self.sgd_rate = 32
+        self.gen_opt = tf.keras.optimizers.Adam(g_lr)
+        self.dis_opt = tf.keras.optimizers.Adam(d_lr)
+        self.cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        self.d_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='dis_loss')
+        self.g_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='gen_loss')
+
+        self.generator = Generator(input_length, d_model)
+        self.discriminator = Discriminator(input_length, d_model, rate=dropout)
+
+        if train:
+            self.g_accumulators = [tf.Variable(tf.zeros_like(tv.initialized_value(), trainable=False)) 
+                                    for tv in self.generator.trainable_variables]
+            self.d_accumulators = [tf.Variable(tf.zeros_like(tv.initialized_value(), trainable=False)) 
+                                    for tv in self.discriminator.trainable_variables]
+
+            self.g_counter = tf.Variable(0.0, trainable=False)
+            self.d_counter = tf.Variable(0.0, trainable=False)
+
+    def d_loss(self, real_output, fake_output, noise_scaler=0.05):
+        def random_noise(output):
+            return noise_scaler * tf.random.uniform(output.shape)
+
+        real_loss = self.cross_entropy(
+            tf.ones_like(real_output) + random_noise(real_output),
+            real_output)
+        fake_loss = self.cross_entropy(
+            tf.zeros_like(fake_output) + random_noise(fake_output),
+            fake_output)
+
+        return real_loss + fake_loss
+
+    def g_loss(self, fake_output):
+        return self.cross_entropy(tf.ones_like(fake_output), fake_output)
+
+    @tf.function
+    def train_step(self, audio, latent_dim, gradient_offset=2):
+        noise = tf.random.normal([audio.shape[0], latent_dim])
+
+        for _ in range(gradient_offset - 1):
+            with tf.GradientTape() as gen_tape:
+                generated_audio = self.generator(noise, training=True)
+
+                real_output = self.discriminator(audio, training=False)
+                fake_output = self.discriminator(generated_audio, training=False)
+
+                gen_loss = self.g_loss(fake_output)
+
+                self.g_metric_loss(tf.ones_like(real_output), fake_output)
+
+            # gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+            # gen_pairs = zip(gen_grads, self.generator.trainable_variables)
+
+            # apply gradient update stochastically
+            # 1 / sgd_rate chance randint returns 0
+            if random.randint(0, self.sgd_rate) == 0:
+                gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+                self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
+
+        with tf.GradientTape() as gen_tape, tf.GradientTape() as dis_tape:
+            generated_audio = self.generator(noise, training=True)
+
+            real_output = self.discriminator(audio, training=True)
+            fake_output = self.discriminator(generated_audio, training=True)
+
+            dis_loss = self.d_loss(real_output, fake_output, noise_scaler=self.d_noise)
+            gen_loss = self.g_loss(fake_output)
+
+            self.d_metric_loss(real_output, fake_output)
+            self.g_metric_loss(tf.ones_like(real_output), fake_output)
+
+        # apply gradient update stochastically
+        # 1 / sgd_rate chance randint returns 0
+        if random.randint(0, self.sgd_rate) == 0:
+            dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
+            gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+            self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
+            self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
+
 
 def main():
     dataset = tf.data.Dataset.from_generator(load_mp3s, (tf.float32)).batch(BATCH_SIZE)
-    
-    generator = Generator(INPUT_LENGTH, SOUND_DIM)
-    discriminator = Discriminator(INPUT_LENGTH, SOUND_DIM)
-    
-    gen_opt = tf.keras.optimizers.Adam(1e-4)
-    dis_opt = tf.keras.optimizers.Adam(1e-6)
+
+    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.4)
 
     checkpoint_dir = "./mgan"
     checkpoint_freq = 2000
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-    checkpoint = tf.train.Checkpoint(generator_optimizer=gen_opt,
-                                     discriminator_optimizer=dis_opt,
-                                     generator=generator,
-                                     discriminator=discriminator)
-    
+    checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
+                                     discriminator_optimizer=gan.dis_opt,
+                                     generator=gan.generator,
+                                     discriminator=gan.discriminator)
+    if restore_latest:
+        checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
+
     for e in range(EPOCHS):
         pbar = tqdm.tqdm(total=len(filenames) // BATCH_SIZE)
         for i, batch in enumerate(dataset):
-            train_step(generator, discriminator, batch, latent_dim=LATENT_DIM)
+            gan.train_step(batch, LATENT_DIM)
             description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
-                                                                                   g_metric_loss.result(), 
-                                                                                   d_metric_loss.result())
+                                                                                   gan.g_metric_loss.result(), 
+                                                                                   gan.d_metric_loss.result())
             pbar.set_description(description)
 
             if i % checkpoint_freq == 0:
@@ -264,8 +303,8 @@ def main():
 
         pbar.close()
 
-        g_metric_loss.reset_states()
-        d_metric_loss.reset_states()
+        gan.g_metric_loss.reset_states()
+        gan.d_metric_loss.reset_states()
 
 
 if __name__ == '__main__':
