@@ -10,16 +10,24 @@ import IPython.display as ipd
 import glob
 import random
 import warnings
+import pickle
+from sklearn import preprocessing
 
+
+normalizer = preprocessing.MaxAbsScaler()
 audio_dir = os.path.join(os.getcwd(), 'music-data')
-filenames = glob.glob(audio_dir + '/fma_small/' + '/*[0-9]/*')
+#filenames = glob.glob(audio_dir + '/fma_small/' + '/*[0-9]/*')
+
+with open('electronic-songs.p', 'rb') as f:
+    filenames = pickle.load(f)
+
 random.seed(8)
 random.shuffle(filenames)
 
 SR = 14400
-INPUT_LENGTH = 5000
-BATCH_SIZE = 1
-SOUND_DIM = 8
+INPUT_LENGTH = 20
+BATCH_SIZE = 16
+SOUND_DIM = 844
 EPOCHS = 50
 LATENT_DIM = 6
 restore_latest = False
@@ -51,6 +59,27 @@ def load_mp3s():
         
         # audio data is loaded in the range [-1, 1]
         yield x.reshape(-1, 1) # + pos_encoding ?
+
+
+def load_spectrograms():
+    for i in range(len(filenames)):
+        # ignore PySoundFile failure warning
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            try:
+                x, _ = librosa.load(filenames[i], sr=SR, res_type='kaiser_fast')
+            except:
+                continue
+
+        spec = librosa.feature.mfcc(y=x, sr=SR)
+        spec = normalizer.fit_transform(spec)  # normalize in range [-1, 1]
+
+        if spec.shape[-1] < SOUND_DIM:
+            offset = SOUND_DIM - spec.shape[-1]
+            spec = np.pad(spec, ((0, 0), (0, offset)), 'constant')
+        elif spec.shape[-1] > SOUND_DIM:
+            spec = spec[:, :SOUND_DIM]
+        yield spec
 
 
 @tf.function
@@ -120,7 +149,7 @@ class Generator(tf.keras.Model):
         self.mha2 = MultiHeadAttn(d_model, 4)
     
         self.linear = layers.Dense(self.seq_len)
-        self.fake_output = layers.Dense(1, activation='tanh')
+        self.fake_output = layers.Dense(d_model, activation='tanh')
         
     def call(self, x):
         x = self.dense1(x)
@@ -140,7 +169,7 @@ class Generator(tf.keras.Model):
         
         x = self.linear(x)
         return self.fake_output(x)
-    
+
 
 class Discriminator(tf.keras.Model):
     def __init__(self, input_length, d_model, rate=0.1):
@@ -169,17 +198,17 @@ class Discriminator(tf.keras.Model):
     def call(self, x, training=True):
         attn1, _ = self.mha1(x, x, x)
         attn1 = self.dropout1(attn1, training=training)
-        out1 = self.layernorm1(attn1 + x)  # + for residual connection
+        out1 = self.layernorm1(attn1)
         out1 = self.leaky_relu(out1)
 
         attn2, _ = self.mha2(out1, out1, out1)
         attn2 = self.dropout2(attn2, training=training)
-        out2 = self.layernorm2(attn2 + out1)
+        out2 = self.layernorm2(attn2)
         out2 = self.leaky_relu(out2)
 
         out3 = self.linear(out2)
         out3 = self.dropout3(out3, training=training)
-        out3 = self.layernorm3(out3 + out2)
+        out3 = self.layernorm3(out3)
         out3 = self.leaky_relu(out3)
 
         prediction = self.flatten(out3)
@@ -247,9 +276,9 @@ class MusicGAN:
 
             # apply gradient update stochastically
             # 1 / sgd_rate chance randint returns 0
-            if random.randint(0, self.sgd_rate) == 0:
-                gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
-                self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
+            #if random.randint(0, self.sgd_rate) == 0:
+            gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+            self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
         with tf.GradientTape() as gen_tape, tf.GradientTape() as dis_tape:
             generated_audio = self.generator(noise, training=True)
@@ -265,21 +294,21 @@ class MusicGAN:
 
         # apply gradient update stochastically
         # 1 / sgd_rate chance randint returns 0
-        if random.randint(0, self.sgd_rate) == 0:
-            dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
-            gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
-            self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
-            self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
+        #if random.randint(0, self.sgd_rate) == 0:
+        dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
+        gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+        self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
+        self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
 
 def main():
-    dataset = tf.data.Dataset.from_generator(load_mp3s, (tf.float32)).batch(BATCH_SIZE)
+    dataset = tf.data.Dataset.from_generator(load_spectrograms, (tf.float32)).batch(BATCH_SIZE)
 
-    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.4)
+    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.20, d_lr=1e-6)
 
-    checkpoint_dir = "./mgan"
-    checkpoint_freq = 2000
-    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+    checkpoint_dir = "./mgan-spec"
+    checkpoint_freq = 200
+    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt-spec")
     checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
                                      discriminator_optimizer=gan.dis_opt,
                                      generator=gan.generator,
@@ -290,7 +319,7 @@ def main():
     for e in range(EPOCHS):
         pbar = tqdm.tqdm(total=len(filenames) // BATCH_SIZE)
         for i, batch in enumerate(dataset):
-            gan.train_step(batch, LATENT_DIM)
+            gan.train_step(batch, LATENT_DIM, gradient_offset=1)
             description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
                                                                                    gan.g_metric_loss.result(), 
                                                                                    gan.d_metric_loss.result())
