@@ -271,12 +271,6 @@ class MusicGAN:
 
                 self.g_metric_loss(tf.ones_like(real_output), fake_output)
 
-            # gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
-            # gen_pairs = zip(gen_grads, self.generator.trainable_variables)
-
-            # apply gradient update stochastically
-            # 1 / sgd_rate chance randint returns 0
-            #if random.randint(0, self.sgd_rate) == 0:
             gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
             self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
@@ -292,21 +286,27 @@ class MusicGAN:
             self.d_metric_loss(real_output, fake_output)
             self.g_metric_loss(tf.ones_like(real_output), fake_output)
 
-        # apply gradient update stochastically
-        # 1 / sgd_rate chance randint returns 0
-        #if random.randint(0, self.sgd_rate) == 0:
         dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
         gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
         self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
         self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
+    def sample(self, n=1, fp='.'):
+        seed = tf.random.normal([n, LATENT_DIM])
+        s = self.generator(seed, training=False)
+        for i in tqdm.trange(n):
+            inverted = normalizer.inverse_transform(s[i])
+            sample = librosa.feature.inverse.mel_to_audio(inverted, sr=SR, dtype=np.float64)
+
+            filename = os.path.join(fp, "sample_{}.wav".format(i+1))
+            librosa.output.write_wav(filename, sample, SR, norm=True)
 
 def main():
     dataset = tf.data.Dataset.from_generator(load_spectrograms, (tf.float32)).batch(BATCH_SIZE)
 
     gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.20, d_lr=1e-6)
 
-    checkpoint_dir = "./mgan-spec"
+    checkpoint_dir = os.path.join('.', 'mgan-spec')
     checkpoint_freq = 200
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt-spec")
     checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
