@@ -11,6 +11,7 @@ import glob
 import random
 import warnings
 import pickle
+import time
 from sklearn import preprocessing
 
 
@@ -21,15 +22,15 @@ audio_dir = os.path.join(os.getcwd(), 'music-data')
 with open('electronic-songs.p', 'rb') as f:
     filenames = pickle.load(f)
 
-random.seed(8)
+#random.seed(8)
 random.shuffle(filenames)
 
 SR = 14400
 INPUT_LENGTH = 20
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 SOUND_DIM = 844
 EPOCHS = 50
-LATENT_DIM = 6
+LATENT_DIM = 100
 restore_latest = False
 
 
@@ -91,6 +92,13 @@ def scaled_dot_product_attention(q, k, v):
     return output, attn_weights
 
 
+def point_wise_feed_forward_network(d_model, dff):
+    return tf.keras.Sequential([
+        tf.keras.layers.Dense(dff, activation='relu'),  # (batch_size, seq_len, dff)
+        tf.keras.layers.Dense(d_model)  # (batch_size, seq_len, d_model)
+    ])
+
+
 class MultiHeadAttn(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads):
         super(MultiHeadAttn, self).__init__()
@@ -131,7 +139,44 @@ class MultiHeadAttn(tf.keras.layers.Layer):
         
         return output, attn_weights
 
-    
+
+class AttentionBlock(tf.keras.Model):
+    def __init__(self, d_model, n_heads, dff, dropout=None):
+        super(AttentionBlock, self).__init__()
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.rate = dropout
+
+        self.mha = MultiHeadAttn(d_model, n_heads)
+        self.ffn = point_wise_feed_forward_network(d_model, dff)
+
+        if self.rate is not None:
+            self.dropout1 = layers.Dropout(self.rate)
+            self.dropout2 = layers.Dropout(self.rate)
+        
+        self.layer_norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layer_norm2 = layers.LayerNormalization(epsilon=1e-6)
+
+        self.leaky_relu = layers.LeakyReLU()
+
+    def call(self, x, training=True):
+        attn, _ = self.mha(x, x, x)
+        if self.dropout is not None:
+            attn = self.dropout1(attn, training=training)
+        out1 = self.layer_norm1(attn)
+        out1 = self.leaky_relu(out1)
+
+        ffn_output = self.ffn(out1)
+        if self.rate is not None:
+            ffn_output = self.dropout2(ffn_output, training=training)
+
+        out2 = self.layer_norm2(ffn_output)
+        out2 = self.leaky_relu(out2)
+
+        return out2
+
+
 class Generator(tf.keras.Model):
     def __init__(self, input_length, d_model):
         super(Generator, self).__init__()
@@ -172,7 +217,7 @@ class Generator(tf.keras.Model):
 
 
 class Discriminator(tf.keras.Model):
-    def __init__(self, input_length, d_model, rate=0.1):
+    def __init__(self, input_length, d_model, rate=0.1, n_heads=4, dff=2048):
         super(Discriminator, self).__init__()
         
         self.seq_len = input_length
@@ -183,17 +228,20 @@ class Discriminator(tf.keras.Model):
         
         self.mha1 = MultiHeadAttn(d_model, 4)
         self.mha2 = MultiHeadAttn(d_model, 4)
+        self.mha3 = MultiHeadAttn(d_model, 4)
 
-        self.linear = layers.Dense(d_model)
+        self.linear = layers.Dense(d_model, activation='relu')
         self.out = layers.Dense(1)
 
         self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
         self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
         self.layernorm3 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm4 = layers.LayerNormalization(epsilon=1e-6)
 
         self.dropout1 = layers.Dropout(rate)
         self.dropout2 = layers.Dropout(rate)
         self.dropout3 = layers.Dropout(rate)
+        self.dropout4 = layers.Dropout(rate)
         
     def call(self, x, training=True):
         attn1, _ = self.mha1(x, x, x)
@@ -206,12 +254,17 @@ class Discriminator(tf.keras.Model):
         out2 = self.layernorm2(attn2)
         out2 = self.leaky_relu(out2)
 
-        out3 = self.linear(out2)
-        out3 = self.dropout3(out3, training=training)
-        out3 = self.layernorm3(out3)
+        attn3, _ = self.mha3(out2, out2, out2)
+        attn3 = self.dropout3(attn3, training=training)
+        out3 = self.layernorm3(attn3)
         out3 = self.leaky_relu(out3)
 
-        prediction = self.flatten(out3)
+        out4 = self.layernorm4(out3)
+        out4 = self.dropout4(out4, training=training)
+        out4 = self.linear(out4)
+        out4 = self.leaky_relu(out4)
+
+        prediction = self.flatten(out4)
         return self.out(prediction)
 
 
@@ -304,10 +357,16 @@ class MusicGAN:
 def main():
     dataset = tf.data.Dataset.from_generator(load_spectrograms, (tf.float32)).batch(BATCH_SIZE)
 
-    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.20, d_lr=1e-6)
+    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.15, d_lr=1e-6)
 
-    checkpoint_dir = os.path.join('.', 'mgan-spec')
-    checkpoint_freq = 200
+    stamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
+    logdir = os.path.join('.', 'logs', stamp)
+    grad_logdir = os.path.join(logdir, 'metrics')
+    graph_writer = tf.summary.create_file_writer(logdir)
+    train_summary_writer = tf.summary.create_file_writer(grad_logdir)
+
+    checkpoint_dir = os.path.join('.', 'mgan-spec_' + stamp)
+    checkpoint_freq = 100
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt-spec")
     checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
                                      discriminator_optimizer=gan.dis_opt,
@@ -316,10 +375,23 @@ def main():
     if restore_latest:
         checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
 
+    trace = True
     for e in range(EPOCHS):
         pbar = tqdm.tqdm(total=len(filenames) // BATCH_SIZE)
         for i, batch in enumerate(dataset):
+            tf.summary.trace_on(graph=True, profiler=True)
             gan.train_step(batch, LATENT_DIM, gradient_offset=1)
+
+            # trace graph only once
+            if trace:
+                with graph_writer.as_default():
+                    tf.summary.trace_export(name="music_gan", step=0, profiler_outdir=logdir)
+                trace = False
+
+            with train_summary_writer.as_default():
+                tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i)
+                tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i)
+        
             description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
                                                                                    gan.g_metric_loss.result(), 
                                                                                    gan.d_metric_loss.result())
