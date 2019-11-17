@@ -31,6 +31,7 @@ BATCH_SIZE = 32
 SOUND_DIM = 844
 EPOCHS = 50
 LATENT_DIM = 100
+NUM_THREADS = 8
 restore_latest = False
 
 
@@ -92,13 +93,6 @@ def scaled_dot_product_attention(q, k, v):
     return output, attn_weights
 
 
-def point_wise_feed_forward_network(d_model, dff):
-    return tf.keras.Sequential([
-        tf.keras.layers.Dense(dff, activation='relu'),  # (batch_size, seq_len, dff)
-        tf.keras.layers.Dense(d_model)  # (batch_size, seq_len, d_model)
-    ])
-
-
 class MultiHeadAttn(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads):
         super(MultiHeadAttn, self).__init__()
@@ -149,7 +143,8 @@ class AttentionBlock(tf.keras.Model):
         self.rate = dropout
 
         self.mha = MultiHeadAttn(d_model, n_heads)
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
+        self.ffn1 = layers.Dense(dff, activation='relu')
+        self.ffn_out = layers.Dense(d_model)
 
         if self.rate is not None:
             self.dropout1 = layers.Dropout(self.rate)
@@ -161,20 +156,21 @@ class AttentionBlock(tf.keras.Model):
         self.leaky_relu = layers.LeakyReLU()
 
     def call(self, x, training=True):
-        attn, _ = self.mha(x, x, x)
-        if self.dropout is not None:
+        attn, attn_weights = self.mha(x, x, x)
+        if self.rate is not None:
             attn = self.dropout1(attn, training=training)
         out1 = self.layer_norm1(attn)
         out1 = self.leaky_relu(out1)
 
-        ffn_output = self.ffn(out1)
+        ffn_output = self.ffn1(out1)
+        ffn_output = self.ffn_out(ffn_output)
         if self.rate is not None:
             ffn_output = self.dropout2(ffn_output, training=training)
 
         out2 = self.layer_norm2(ffn_output)
         out2 = self.leaky_relu(out2)
 
-        return out2
+        return out2, attn_weights
 
 
 class Generator(tf.keras.Model):
@@ -225,46 +221,25 @@ class Discriminator(tf.keras.Model):
         
         self.leaky_relu = layers.LeakyReLU()
         self.flatten = layers.Flatten()
-        
-        self.mha1 = MultiHeadAttn(d_model, 4)
-        self.mha2 = MultiHeadAttn(d_model, 4)
-        self.mha3 = MultiHeadAttn(d_model, 4)
+
+        self.attn_block1 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
+        self.attn_block2 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
+        self.attn_block3 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
+        self.attn_block4 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
 
         self.linear = layers.Dense(d_model, activation='relu')
         self.out = layers.Dense(1)
-
-        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm3 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm4 = layers.LayerNormalization(epsilon=1e-6)
-
-        self.dropout1 = layers.Dropout(rate)
-        self.dropout2 = layers.Dropout(rate)
-        self.dropout3 = layers.Dropout(rate)
-        self.dropout4 = layers.Dropout(rate)
         
     def call(self, x, training=True):
-        attn1, _ = self.mha1(x, x, x)
-        attn1 = self.dropout1(attn1, training=training)
-        out1 = self.layernorm1(attn1)
-        out1 = self.leaky_relu(out1)
+        attn1, _ = self.attn_block1(x)
+        attn2, _ = self.attn_block2(attn1)
+        attn3, _ = self.attn_block3(attn2)
+        attn4, _ = self.attn_block4(attn3)
 
-        attn2, _ = self.mha2(out1, out1, out1)
-        attn2 = self.dropout2(attn2, training=training)
-        out2 = self.layernorm2(attn2)
-        out2 = self.leaky_relu(out2)
+        linear1 = self.linear(attn4)
+        linear1 = self.leaky_relu(linear1)
 
-        attn3, _ = self.mha3(out2, out2, out2)
-        attn3 = self.dropout3(attn3, training=training)
-        out3 = self.layernorm3(attn3)
-        out3 = self.leaky_relu(out3)
-
-        out4 = self.layernorm4(out3)
-        out4 = self.dropout4(out4, training=training)
-        out4 = self.linear(out4)
-        out4 = self.leaky_relu(out4)
-
-        prediction = self.flatten(out4)
+        prediction = self.flatten(linear1)
         return self.out(prediction)
 
 
@@ -355,8 +330,9 @@ class MusicGAN:
             librosa.output.write_wav(filename, sample, SR, norm=True)
 
 def main():
-    dataset = tf.data.Dataset.from_generator(load_spectrograms, (tf.float32)).batch(BATCH_SIZE)
-
+    dataset = tf.data.Dataset.from_generator(load_spectrograms, (tf.float32))
+    dataset = dataset.map(lambda x : x, num_parallel_calls=NUM_THREADS).prefetch(buffer_size=1000)
+    dataset = dataset.batch(BATCH_SIZE)
     gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.15, d_lr=1e-6)
 
     stamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
@@ -377,7 +353,8 @@ def main():
 
     trace = True
     for e in range(EPOCHS):
-        pbar = tqdm.tqdm(total=len(filenames) // BATCH_SIZE)
+        n_batches = len(filenames) // BATCH_SIZE
+        pbar = tqdm.tqdm(total=n_batches)
         for i, batch in enumerate(dataset):
             tf.summary.trace_on(graph=True, profiler=True)
             gan.train_step(batch, LATENT_DIM, gradient_offset=1)
@@ -389,8 +366,8 @@ def main():
                 trace = False
 
             with train_summary_writer.as_default():
-                tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i)
-                tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i)
+                tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i + (n_batches * e))
+                tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i + (n_batches * e))
         
             description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
                                                                                    gan.g_metric_loss.result(), 
