@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras import layers
+from tensorflow.compat.v1 import flags
 import os
 import tqdm
 import pandas as pd
@@ -11,9 +12,13 @@ import glob
 import random
 import warnings
 import pickle
+import json
 import time
 from sklearn import preprocessing
 
+FLAGS = flags.FLAGS
+
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 normalizer = preprocessing.MaxAbsScaler()
 audio_dir = os.path.join(os.getcwd(), 'music-data')
@@ -22,8 +27,33 @@ audio_dir = os.path.join(os.getcwd(), 'music-data')
 with open('electronic-songs.p', 'rb') as f:
     filenames = pickle.load(f)
 
-#random.seed(8)
+
+flags.DEFINE_integer('batch', 32, 'Batch size')
+flags.DEFINE_integer('epochs', 50, 'Number of iterations to train on the entire dataset')
+flags.DEFINE_integer('latent', 100, 'Dimensionality of the latent space')
+flags.DEFINE_boolean('restore_latest', False, 'Restore latest checkpoint')
+flags.DEFINE_string('output_dir', '.', 'Path to model checkpoints and logs')
+flags.DEFINE_string('dtype', 'float32', 'Floating point data type of tensorflow graph')
+flags.DEFINE_boolean('train', False, 'Train the music GAN')
+flags.DEFINE_integer('seed', -1, 'Random seed for data shuffling and latent vector generator')
+flags.DEFINE_boolean('logging', False, 'Whether or not to log and checkpoint the training model')
+flags.DEFINE_integer('sampling_rate', 14400, 'Sampling rate of loaded music files')
+flags.DEFINE_float('g_lr', 1e-4, 'Learning rate of the generator')
+flags.DEFINE_float('d_lr', 1e-6, 'Learning rate of the discriminator')
+flags.DEFINE_float('dropout', 0.1, 'Dropout rate of the discriminator')
+flags.DEFINE_integer('g_attn', 2, 'Number of multi-head attention layers in the generator')
+flags.DEFINE_integer('d_attn', 4, 'Number of multi-head attention layers in the disciminator')
+flags.DEFINE_float('noise', 0.1, 'Level of noise added to discriminator input data')
+flags.DEFINE_integer('heads', 4, 'Number of heads in ALL multi-head attention blocks')
+
+
+if FLAGS.seed != -1:
+    random.seed(FLAGS.seed)
+    tf.random.set_random_seed(FLAGS.seed)
+
 random.shuffle(filenames)
+
+tf.keras.backend.set_floatx(FLAGS.dtype)
 
 SR = 14400
 INPUT_LENGTH = 20
@@ -31,8 +61,9 @@ BATCH_SIZE = 32
 SOUND_DIM = 844
 EPOCHS = 50
 LATENT_DIM = 100
-NUM_THREADS = 8
+NUM_THREADS = 12
 restore_latest = False
+DTYPE = tf.float16 if FLAGS.dtype == 'float16' else tf.float32
 
 
 # https://www.kaggle.com/fizzbuzz/beginner-s-guide-to-audio-data
@@ -73,7 +104,7 @@ def load_spectrograms():
             except:
                 continue
 
-        spec = librosa.feature.mfcc(y=x, sr=SR)
+        spec = librosa.feature.mfcc(y=x, sr=SR, dtype=np.float16 if FLAGS.dtype == 'float16' else np.float32)
         spec = normalizer.fit_transform(spec)  # normalize in range [-1, 1]
 
         if spec.shape[-1] < SOUND_DIM:
@@ -86,7 +117,7 @@ def load_spectrograms():
 
 @tf.function
 def scaled_dot_product_attention(q, k, v):
-    dk = tf.cast(tf.shape(k)[-1], tf.float32)
+    dk = tf.cast(tf.shape(k)[-1], DTYPE)
     z = tf.matmul(q, k, transpose_b=True) / tf.math.sqrt(dk)
     attn_weights = tf.nn.softmax(z)
     output = tf.matmul(tf.nn.softmax(z, axis=-1), v)
@@ -174,11 +205,14 @@ class AttentionBlock(tf.keras.Model):
 
 
 class Generator(tf.keras.Model):
-    def __init__(self, input_length, d_model):
+    def __init__(self, input_length, d_model, n_heads=4, dff=2048, n_blocks=2):
         super(Generator, self).__init__()
         
         self.seq_len = input_length
         self.d_model = d_model
+        self.n_blocks = n_blocks
+
+        self.attn_layers = [AttentionBlock(d_model, n_heads, dff) for _ in range(n_blocks)]
         
         self.leaky_relu = layers.LeakyReLU()
         self.layer_norm1 = layers.LayerNormalization(epsilon=1e-6)
@@ -186,8 +220,8 @@ class Generator(tf.keras.Model):
         self.layer_norm3 = layers.LayerNormalization(epsilon=1e-6)
         
         self.dense1 = layers.Dense(self.seq_len * d_model)
-        self.mha1 = MultiHeadAttn(d_model, 4)
-        self.mha2 = MultiHeadAttn(d_model, 4)
+        self.mha1 = MultiHeadAttn(d_model, n_heads)
+        self.mha2 = MultiHeadAttn(d_model, n_heads)
     
         self.linear = layers.Dense(self.seq_len)
         self.fake_output = layers.Dense(d_model, activation='tanh')
@@ -200,43 +234,32 @@ class Generator(tf.keras.Model):
         x = tf.reshape(x, [-1, self.seq_len, self.d_model])
 
         # self attention blocks
-        x, _ = self.mha1(x, x, x)
-        x = self.layer_norm2(x)
-        x = self.leaky_relu(x)
-        
-        x, _ = self.mha2(x, x, x)
-        x = self.layer_norm3(x)
-        x = self.leaky_relu(x)
+        for i in range(self.n_blocks):
+            x, _ = self.attn_layers[i] (x)
         
         x = self.linear(x)
         return self.fake_output(x)
 
 
 class Discriminator(tf.keras.Model):
-    def __init__(self, input_length, d_model, rate=0.1, n_heads=4, dff=2048):
+    def __init__(self, input_length, d_model, rate=0.1, n_heads=4, dff=2048, n_blocks=4):
         super(Discriminator, self).__init__()
-        
-        self.seq_len = input_length
-        self.d_model = d_model
+
+        self.n_blocks = n_blocks
         
         self.leaky_relu = layers.LeakyReLU()
         self.flatten = layers.Flatten()
 
-        self.attn_block1 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
-        self.attn_block2 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
-        self.attn_block3 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
-        self.attn_block4 = AttentionBlock(d_model, n_heads, dff, dropout=rate)
+        self.attn_layers = [AttentionBlock(d_model, n_heads, dff, dropout=rate) for _ in range(n_blocks)]
 
         self.linear = layers.Dense(d_model, activation='relu')
         self.out = layers.Dense(1)
         
     def call(self, x, training=True):
-        attn1, _ = self.attn_block1(x)
-        attn2, _ = self.attn_block2(attn1)
-        attn3, _ = self.attn_block3(attn2)
-        attn4, _ = self.attn_block4(attn3)
+        for i in range(self.n_blocks):
+            x, _ = self.attn_layers[i](x)
 
-        linear1 = self.linear(attn4)
+        linear1 = self.linear(x)
         linear1 = self.leaky_relu(linear1)
 
         prediction = self.flatten(linear1)
@@ -247,7 +270,7 @@ class MusicGAN:
     def __init__(self, input_length, d_model, dropout=0.1, d_noise=0.05, g_lr=1e-4, d_lr=1e-5, train=False):
         self.input_length = input_length
         self.d_model = d_model
-        self.d_noise = d_noise
+        self.d_noise = d_noise  # fraction of noise to add to discriminator input data
 
         self.sgd_rate = 32
         self.gen_opt = tf.keras.optimizers.Adam(g_lr)
@@ -256,21 +279,16 @@ class MusicGAN:
         self.d_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='dis_loss')
         self.g_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='gen_loss')
 
-        self.generator = Generator(input_length, d_model)
-        self.discriminator = Discriminator(input_length, d_model, rate=dropout)
-
-        if train:
-            self.g_accumulators = [tf.Variable(tf.zeros_like(tv.initialized_value(), trainable=False)) 
-                                    for tv in self.generator.trainable_variables]
-            self.d_accumulators = [tf.Variable(tf.zeros_like(tv.initialized_value(), trainable=False)) 
-                                    for tv in self.discriminator.trainable_variables]
-
-            self.g_counter = tf.Variable(0.0, trainable=False)
-            self.d_counter = tf.Variable(0.0, trainable=False)
+        self.generator = Generator(input_length, d_model, n_blocks=FLAGS.g_attn, n_heads=FLAGS.heads)
+        self.discriminator = Discriminator(input_length, d_model, n_blocks=FLAGS.d_attn, rate=dropout, n_heads=FLAGS.heads)
 
     def d_loss(self, real_output, fake_output, noise_scaler=0.05):
         def random_noise(output):
-            return noise_scaler * tf.random.uniform(output.shape)
+            return noise_scaler * tf.random.uniform(
+                output.shape,
+                dtype=FLAGS.dtype,
+                seed=FLAGS.seed if FLAGS.seed != -1 else None
+                )
 
         real_loss = self.cross_entropy(
             tf.ones_like(real_output) + random_noise(real_output),
@@ -320,7 +338,7 @@ class MusicGAN:
         self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
     def sample(self, n=1, fp='.'):
-        seed = tf.random.normal([n, LATENT_DIM])
+        seed = tf.random.normal([n, FLAGS.latent])
         s = self.generator(seed, training=False)
         for i in tqdm.trange(n):
             inverted = normalizer.inverse_transform(s[i])
@@ -329,60 +347,66 @@ class MusicGAN:
             filename = os.path.join(fp, "sample_{}.wav".format(i+1))
             librosa.output.write_wav(filename, sample, SR, norm=True)
 
+
 def main():
-    dataset = tf.data.Dataset.from_generator(load_spectrograms, (tf.float32))
-    dataset = dataset.map(lambda x : x, num_parallel_calls=NUM_THREADS).prefetch(buffer_size=1000)
-    dataset = dataset.batch(BATCH_SIZE)
-    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, dropout=0.15, d_lr=1e-6)
+    dataset = tf.data.Dataset.from_generator(load_spectrograms, (DTYPE)).batch(FLAGS.batch)
+    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, d_noise=FLAGS.noise, dropout=FLAGS.dropout, d_lr=FLAGS.d_lr, g_lr=FLAGS.g_lr)
 
     stamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
-    logdir = os.path.join('.', 'logs', stamp)
+    logdir = os.path.join(FLAGS.output_dir, 'logs', stamp)
     grad_logdir = os.path.join(logdir, 'metrics')
-    graph_writer = tf.summary.create_file_writer(logdir)
-    train_summary_writer = tf.summary.create_file_writer(grad_logdir)
+    if FLAGS.logging:
+        graph_writer = tf.summary.create_file_writer(logdir)
+        train_summary_writer = tf.summary.create_file_writer(grad_logdir)
+        with open(os.path.join(logdir, 'hparams.json'), 'w') as hpf:
+            json.dump(FLAGS.flag_values_dict(), hpf)
 
-    checkpoint_dir = os.path.join('.', 'mgan-spec_' + stamp)
+    checkpoint_dir = os.path.join(FLAGS.output_dir, 'checkpoints', 'mgan-spec_' + stamp)
     checkpoint_freq = 100
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt-spec")
     checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
                                      discriminator_optimizer=gan.dis_opt,
                                      generator=gan.generator,
                                      discriminator=gan.discriminator)
-    if restore_latest:
+    if FLAGS.restore_latest:
         checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
 
-    trace = True
-    for e in range(EPOCHS):
-        n_batches = len(filenames) // BATCH_SIZE
-        pbar = tqdm.tqdm(total=n_batches)
-        for i, batch in enumerate(dataset):
-            tf.summary.trace_on(graph=True, profiler=True)
-            gan.train_step(batch, LATENT_DIM, gradient_offset=1)
+    if FLAGS.train:
+        trace = True
+        for e in range(FLAGS.epochs):
+            n_batches = len(filenames) // FLAGS.batch
+            pbar = tqdm.tqdm(total=n_batches)
+            for i, batch in enumerate(dataset):
+                if FLAGS.logging:
+                    tf.summary.trace_on(graph=True, profiler=True)
 
-            # trace graph only once
-            if trace:
-                with graph_writer.as_default():
-                    tf.summary.trace_export(name="music_gan", step=0, profiler_outdir=logdir)
-                trace = False
+                gan.train_step(batch, FLAGS.latent, gradient_offset=1)
 
-            with train_summary_writer.as_default():
-                tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i + (n_batches * e))
-                tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i + (n_batches * e))
-        
-            description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
-                                                                                   gan.g_metric_loss.result(), 
-                                                                                   gan.d_metric_loss.result())
-            pbar.set_description(description)
+                # trace graph only once
+                if trace and FLAGS.logging:
+                    with graph_writer.as_default():
+                        tf.summary.trace_export(name="music_gan", step=0, profiler_outdir=logdir)
+                    trace = False
 
-            if i % checkpoint_freq == 0:
-                checkpoint.save(file_prefix=checkpoint_prefix)
+                if FLAGS.logging:
+                    with train_summary_writer.as_default():
+                        tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i + (n_batches * e))
+                        tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i + (n_batches * e))
+            
+                description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
+                                                                                    gan.g_metric_loss.result(), 
+                                                                                    gan.d_metric_loss.result())
+                pbar.set_description(description)
 
-            pbar.update(1)
+                if i % checkpoint_freq == 0 and FLAGS.logging:
+                    checkpoint.save(file_prefix=checkpoint_prefix)
 
-        pbar.close()
+                pbar.update(1)
 
-        gan.g_metric_loss.reset_states()
-        gan.d_metric_loss.reset_states()
+            pbar.close()
+
+            gan.g_metric_loss.reset_states()
+            gan.d_metric_loss.reset_states()
 
 
 if __name__ == '__main__':
