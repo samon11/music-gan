@@ -49,7 +49,7 @@ flags.DEFINE_integer('heads', 4, 'Number of heads in ALL multi-head attention bl
 
 if FLAGS.seed != -1:
     random.seed(FLAGS.seed)
-    tf.random.set_random_seed(FLAGS.seed)
+    tf.random.set_seed(FLAGS.seed)
 
 random.shuffle(filenames)
 
@@ -115,6 +115,8 @@ def load_spectrograms():
         yield spec
 
 
+# Multi-head attention classes adapted from Tensorflow docs:
+# https://www.tensorflow.org/tutorials/text/transformer
 @tf.function
 def scaled_dot_product_attention(q, k, v):
     dk = tf.cast(tf.shape(k)[-1], DTYPE)
@@ -282,6 +284,7 @@ class MusicGAN:
         self.generator = Generator(input_length, d_model, n_blocks=FLAGS.g_attn, n_heads=FLAGS.heads)
         self.discriminator = Discriminator(input_length, d_model, n_blocks=FLAGS.d_attn, rate=dropout, n_heads=FLAGS.heads)
 
+    # GAN losses and gradient updates adapted from F. Chollet "Deep Learning with Python"
     def d_loss(self, real_output, fake_output, noise_scaler=0.05):
         def random_noise(output):
             return noise_scaler * tf.random.uniform(
