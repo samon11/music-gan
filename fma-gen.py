@@ -15,6 +15,7 @@ import pickle
 import json
 import time
 from sklearn import preprocessing
+from multiprocessing.dummy import Pool as ThreadPool
 
 FLAGS = flags.FLAGS
 
@@ -29,9 +30,9 @@ with open('electronic-songs.p', 'rb') as f:
 
 
 flags.DEFINE_integer('batch', 32, 'Batch size')
-flags.DEFINE_integer('epochs', 50, 'Number of iterations to train on the entire dataset')
+flags.DEFINE_integer('epochs', 10, 'Number of iterations to train on the entire dataset')
 flags.DEFINE_integer('latent', 100, 'Dimensionality of the latent space')
-flags.DEFINE_boolean('restore_latest', False, 'Restore latest checkpoint')
+flags.DEFINE_string('model_path', '.', 'Path to model checkpoint')
 flags.DEFINE_string('output_dir', '.', 'Path to model checkpoints and logs')
 flags.DEFINE_string('dtype', 'float32', 'Floating point data type of tensorflow graph')
 flags.DEFINE_boolean('train', False, 'Train the music GAN')
@@ -45,6 +46,7 @@ flags.DEFINE_integer('g_attn', 2, 'Number of multi-head attention layers in the 
 flags.DEFINE_integer('d_attn', 4, 'Number of multi-head attention layers in the disciminator')
 flags.DEFINE_float('noise', 0.1, 'Level of noise added to discriminator input data')
 flags.DEFINE_integer('heads', 4, 'Number of heads in ALL multi-head attention blocks')
+flags.DEFINE_boolean('save_data', False, 'Save all training data to a file that will be loaded into memory')
 
 
 if FLAGS.seed != -1:
@@ -105,7 +107,7 @@ def load_spectrograms():
                 continue
 
         spec = librosa.feature.mfcc(y=x, sr=SR, dtype=np.float16 if FLAGS.dtype == 'float16' else np.float32)
-        spec = normalizer.fit_transform(spec)  # normalize in range [-1, 1]
+        spec = spec / 1132.0  # normalize in range [-1, 1], 1132.0 is a previously calculated value
 
         if spec.shape[-1] < SOUND_DIM:
             offset = SOUND_DIM - spec.shape[-1]
@@ -113,6 +115,40 @@ def load_spectrograms():
         elif spec.shape[-1] > SOUND_DIM:
             spec = spec[:, :SOUND_DIM]
         yield spec
+
+
+def threaded_specs(audio_files):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        try:
+            x, _ = librosa.load(audio_files, sr=14400, res_type='kaiser_fast')
+        except:
+            # corrupted file return None
+            return
+
+        spec = librosa.feature.mfcc(y=x, sr=14400)
+
+        if spec.shape[-1] < SOUND_DIM:
+            offset = SOUND_DIM - spec.shape[-1]
+            spec = np.pad(spec, ((0, 0), (0, offset)), 'constant')
+        elif spec.shape[-1] > SOUND_DIM:
+            spec = spec[:, :SOUND_DIM]
+
+        return spec
+
+
+def save_spectograms():
+    # multi-threaded preprocessing
+    print('Starting multithreaded preprocessing took 2.5 hours on Ryzen 5 3600 CPU')
+    pool = ThreadPool()
+    spectograms = pool.map(threaded_specs, filenames)
+    pool.close()
+    pool.join()
+
+    print('Processing completed, saving file...')
+    spectograms = np.array([arr for arr in spectograms if arr is not None])
+    np.save('electronic-specs.npy', spectograms)
+    return spectograms
 
 
 # Multi-head attention classes adapted from Tensorflow docs:
@@ -272,7 +308,7 @@ class MusicGAN:
     def __init__(self, input_length, d_model, dropout=0.1, d_noise=0.05, g_lr=1e-4, d_lr=1e-5, train=False):
         self.input_length = input_length
         self.d_model = d_model
-        self.d_noise = d_noise  # fraction of noise to add to discriminator input data
+        self.d_noise = d_noise  # fraction of noise to add to discriminator labels
 
         self.sgd_rate = 32
         self.gen_opt = tf.keras.optimizers.Adam(g_lr)
@@ -340,22 +376,49 @@ class MusicGAN:
         self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
         self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
-    def sample(self, n=1, fp='.'):
+    def sample(self, scaler, n=1, fp='.'):
         seed = tf.random.normal([n, FLAGS.latent])
         s = self.generator(seed, training=False)
         for i in tqdm.trange(n):
-            inverted = normalizer.inverse_transform(s[i])
-            sample = librosa.feature.inverse.mel_to_audio(inverted, sr=SR, dtype=np.float64)
+            inverted = s[i].numpy() * scaler  # convert back to mel scale
+            sample = librosa.feature.inverse.mel_to_audio(inverted, sr=SR)
 
             filename = os.path.join(fp, "sample_{}.wav".format(i+1))
             librosa.output.write_wav(filename, sample, SR, norm=True)
 
 
 def main():
-    dataset = tf.data.Dataset.from_generator(load_spectrograms, (DTYPE)).batch(FLAGS.batch)
+    max_coeff = 1132.0  # previously calculated value
+    if "electronic-specs.npy" in os.listdir(os.getcwd()):
+        print("using saved data")
+        spectograms = np.load("electronic-specs.npy")
+        max_coeff = np.abs(spectograms).max()
+        spectograms = spectograms / max_coeff  # scale all values to [-1, 1]
+        if str(spectograms.dtype) != FLAGS.dtype:
+            spectograms = spectograms.astype(FLAGS.dtype, copy=False)
+        dataset = tf.data.Dataset.from_tensor_slices(spectograms)\
+            .batch(FLAGS.batch)\
+            .shuffle(buffer_size=spectograms.shape[0], seed=FLAGS.seed)
+    elif FLAGS.save_data:
+        dataset = tf.data.Dataset.from_tensor_slices(save_spectograms() / max_coeff).batch(FLAGS.batch)
+    else:
+        dataset = tf.data.Dataset.from_generator(load_spectrograms, (DTYPE)).batch(FLAGS.batch)
+
     gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, d_noise=FLAGS.noise, dropout=FLAGS.dropout, d_lr=FLAGS.d_lr, g_lr=FLAGS.g_lr)
 
-    stamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
+    checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
+                                     discriminator_optimizer=gan.dis_opt,
+                                     generator=gan.generator,
+                                     discriminator=gan.discriminator)
+    if FLAGS.model_path == '.':
+        stamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
+        checkpoint_dir = os.path.join(FLAGS.output_dir, 'checkpoints', 'mgan-spec_' + stamp)
+        manager = tf.train.CheckpointManager(checkpoint, directory=checkpoint_dir, max_to_keep=3)
+    else:
+        stamp = FLAGS.model_path[-16:]
+        manager = tf.train.CheckpointManager(checkpoint, directory=FLAGS.model_path, max_to_keep=3)
+        checkpoint.restore(manager.latest_checkpoint)
+
     logdir = os.path.join(FLAGS.output_dir, 'logs', stamp)
     grad_logdir = os.path.join(logdir, 'metrics')
     if FLAGS.logging:
@@ -364,23 +427,13 @@ def main():
         with open(os.path.join(logdir, 'hparams.json'), 'w') as hpf:
             json.dump(FLAGS.flag_values_dict(), hpf)
 
-    checkpoint_dir = os.path.join(FLAGS.output_dir, 'checkpoints', 'mgan-spec_' + stamp)
-    checkpoint_freq = 100
-    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt-spec")
-    checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
-                                     discriminator_optimizer=gan.dis_opt,
-                                     generator=gan.generator,
-                                     discriminator=gan.discriminator)
-    if FLAGS.restore_latest:
-        checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
-
     if FLAGS.train:
         trace = True
+        n_batches = len(filenames) // FLAGS.batch
         for e in range(FLAGS.epochs):
-            n_batches = len(filenames) // FLAGS.batch
             pbar = tqdm.tqdm(total=n_batches)
             for i, batch in enumerate(dataset):
-                if FLAGS.logging:
+                if FLAGS.logging and trace:
                     tf.summary.trace_on(graph=True, profiler=True)
 
                 gan.train_step(batch, FLAGS.latent, gradient_offset=1)
@@ -400,16 +453,17 @@ def main():
                                                                                     gan.g_metric_loss.result(), 
                                                                                     gan.d_metric_loss.result())
                 pbar.set_description(description)
-
-                if i % checkpoint_freq == 0 and FLAGS.logging:
-                    checkpoint.save(file_prefix=checkpoint_prefix)
-
                 pbar.update(1)
+
+            if FLAGS.logging:
+                manager.save()
 
             pbar.close()
 
             gan.g_metric_loss.reset_states()
             gan.d_metric_loss.reset_states()
+
+    gan.sample(max_coeff, n=3)
 
 
 if __name__ == '__main__':
