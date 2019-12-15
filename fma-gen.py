@@ -23,9 +23,10 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 normalizer = preprocessing.MaxAbsScaler()
 audio_dir = os.path.join(os.getcwd(), 'music-data')
+SONG_FN = 'dubstep.p'
 #filenames = glob.glob(audio_dir + '/fma_small/' + '/*[0-9]/*')
 
-with open('electronic-songs.p', 'rb') as f:
+with open(SONG_FN, 'rb') as f:
     filenames = pickle.load(f)
 
 
@@ -45,7 +46,8 @@ flags.DEFINE_float('dropout', 0.1, 'Dropout rate of the discriminator')
 flags.DEFINE_integer('g_attn', 2, 'Number of multi-head attention layers in the generator')
 flags.DEFINE_integer('d_attn', 4, 'Number of multi-head attention layers in the disciminator')
 flags.DEFINE_float('noise', 0.1, 'Level of noise added to discriminator input data')
-flags.DEFINE_integer('heads', 4, 'Number of heads in ALL multi-head attention blocks')
+flags.DEFINE_integer('heads', 8, 'Number of heads in ALL multi-head attention blocks')
+flags.DEFINE_integer('d_model', 768, 'Multi-head attention dimensionality')
 flags.DEFINE_boolean('save_data', False, 'Save all training data to a file that will be loaded into memory')
 
 
@@ -57,10 +59,10 @@ random.shuffle(filenames)
 
 tf.keras.backend.set_floatx(FLAGS.dtype)
 
-SR = 14400
-INPUT_LENGTH = 20
+SR = 22050
+INPUT_LENGTH = 40
 BATCH_SIZE = 32
-SOUND_DIM = 844
+SOUND_DIM = 1293
 EPOCHS = 50
 LATENT_DIM = 100
 NUM_THREADS = 12
@@ -90,7 +92,7 @@ def load_mp3s():
                 offset = np.random.randint(max_offset)
             else:
                 offset = 0
-            x = np.pad(x, (offset, INPUT_LENGTH - len(x) - offset), 'constant')
+            x = np.pad(x, (offset, INPUT_LENGTH - len(x) - offset), 'edge')
         
         # audio data is loaded in the range [-1, 1]
         yield x.reshape(-1, 1) # + pos_encoding ?
@@ -111,7 +113,7 @@ def load_spectrograms():
 
         if spec.shape[-1] < SOUND_DIM:
             offset = SOUND_DIM - spec.shape[-1]
-            spec = np.pad(spec, ((0, 0), (0, offset)), 'constant')
+            spec = np.pad(spec, ((0, 0), (0, offset)), 'edge')
         elif spec.shape[-1] > SOUND_DIM:
             spec = spec[:, :SOUND_DIM]
         yield spec
@@ -121,16 +123,16 @@ def threaded_specs(audio_files):
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         try:
-            x, _ = librosa.load(audio_files, sr=14400, res_type='kaiser_fast')
+            x, _ = librosa.load(audio_files, sr=SR, res_type='kaiser_fast')
         except:
             # corrupted file return None
             return
 
-        spec = librosa.feature.mfcc(y=x, sr=14400)
+        spec = librosa.feature.mfcc(y=x, sr=SR, n_mfcc=INPUT_LENGTH)
 
         if spec.shape[-1] < SOUND_DIM:
             offset = SOUND_DIM - spec.shape[-1]
-            spec = np.pad(spec, ((0, 0), (0, offset)), 'constant')
+            spec = np.pad(spec, ((0, 0), (0, offset)), 'edge')
         elif spec.shape[-1] > SOUND_DIM:
             spec = spec[:, :SOUND_DIM]
 
@@ -147,7 +149,7 @@ def save_spectograms():
 
     print('Processing completed, saving file...')
     spectograms = np.array([arr for arr in spectograms if arr is not None])
-    np.save('electronic-specs.npy', spectograms)
+    np.save('dubstep.npy', spectograms)
     return spectograms
 
 
@@ -243,7 +245,7 @@ class AttentionBlock(tf.keras.Model):
 
 
 class Generator(tf.keras.Model):
-    def __init__(self, input_length, d_model, n_heads=4, dff=2048, n_blocks=2):
+    def __init__(self, input_length, d_model, d_output=SOUND_DIM, n_heads=4, dff=2048, n_blocks=2):
         super(Generator, self).__init__()
         
         self.seq_len = input_length
@@ -262,7 +264,7 @@ class Generator(tf.keras.Model):
         self.mha2 = MultiHeadAttn(d_model, n_heads)
     
         self.linear = layers.Dense(self.seq_len)
-        self.fake_output = layers.Dense(d_model, activation='tanh')
+        self.fake_output = layers.Dense(d_output, activation='tanh')
         
     def call(self, x):
         x = self.dense1(x)
@@ -280,7 +282,7 @@ class Generator(tf.keras.Model):
 
 
 class Discriminator(tf.keras.Model):
-    def __init__(self, input_length, d_model, rate=0.1, n_heads=4, dff=2048, n_blocks=4):
+    def __init__(self, input_length, d_model, d_output=SOUND_DIM, rate=0.1, n_heads=4, dff=2048, n_blocks=4):
         super(Discriminator, self).__init__()
 
         self.n_blocks = n_blocks
@@ -290,7 +292,7 @@ class Discriminator(tf.keras.Model):
 
         self.attn_layers = [AttentionBlock(d_model, n_heads, dff, dropout=rate) for _ in range(n_blocks)]
 
-        self.linear = layers.Dense(d_model, activation='relu')
+        self.linear = layers.Dense(d_output, activation='relu')
         self.out = layers.Dense(1)
         
     def call(self, x, training=True):
@@ -330,16 +332,16 @@ class MusicGAN:
                 )
 
         real_loss = self.cross_entropy(
-            tf.ones_like(real_output) + random_noise(real_output),
+            tf.zeros_like(real_output) + random_noise(real_output),
             real_output)
         fake_loss = self.cross_entropy(
-            tf.zeros_like(fake_output) + random_noise(fake_output),
+            tf.ones_like(fake_output) + random_noise(fake_output),
             fake_output)
 
         return real_loss + fake_loss
 
     def g_loss(self, fake_output):
-        return self.cross_entropy(tf.ones_like(fake_output), fake_output)
+        return self.cross_entropy(tf.zeros_like(fake_output), fake_output)
 
     @tf.function
     def train_step(self, audio, latent_dim, gradient_offset=2):
@@ -354,7 +356,7 @@ class MusicGAN:
 
                 gen_loss = self.g_loss(fake_output)
 
-                self.g_metric_loss(tf.ones_like(real_output), fake_output)
+                self.g_metric_loss(tf.zeros_like(real_output), fake_output)
 
             gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
             self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
@@ -369,7 +371,7 @@ class MusicGAN:
             gen_loss = self.g_loss(fake_output)
 
             self.d_metric_loss(real_output, fake_output)
-            self.g_metric_loss(tf.ones_like(real_output), fake_output)
+            self.g_metric_loss(tf.zeros_like(real_output), fake_output)
 
         dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
         gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
@@ -389,9 +391,9 @@ class MusicGAN:
 
 def main():
     max_coeff = 1132.0  # previously calculated value
-    if "electronic-specs.npy" in os.listdir(os.getcwd()):
+    if "dubstep.npy" in os.listdir(os.getcwd()):
         print("using saved data")
-        spectograms = np.load("electronic-specs.npy")
+        spectograms = np.load("dubstep.npy")
         max_coeff = np.abs(spectograms).max()
         spectograms = spectograms / max_coeff  # scale all values to [-1, 1]
         if str(spectograms.dtype) != FLAGS.dtype:
@@ -404,7 +406,7 @@ def main():
     else:
         dataset = tf.data.Dataset.from_generator(load_spectrograms, (DTYPE)).batch(FLAGS.batch)
 
-    gan = MusicGAN(INPUT_LENGTH, SOUND_DIM, d_noise=FLAGS.noise, dropout=FLAGS.dropout, d_lr=FLAGS.d_lr, g_lr=FLAGS.g_lr)
+    gan = MusicGAN(INPUT_LENGTH, FLAGS.d_model, d_noise=FLAGS.noise, dropout=FLAGS.dropout, d_lr=FLAGS.d_lr, g_lr=FLAGS.g_lr)
 
     checkpoint = tf.train.Checkpoint(generator_optimizer=gan.gen_opt,
                                      discriminator_optimizer=gan.dis_opt,
