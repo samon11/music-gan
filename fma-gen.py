@@ -359,8 +359,8 @@ class MusicGAN:
             dis_loss = self.d_loss(real_output, fake_output, noise_scaler=self.d_noise)
             gen_loss = self.g_loss(fake_output)
 
-            self.d_metric_loss(real_output, fake_output)
-            self.g_metric_loss(tf.ones_like(real_output), fake_output)
+            self.d_metric_loss(tf.ones_like(real_output), fake_output)
+            self.g_metric_loss(tf.zeros_like(real_output), fake_output)
 
         dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
         self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
@@ -427,7 +427,7 @@ def main():
 
     if FLAGS.train:
         trace = True
-        generator_wins = 0
+        discriminator_wins = 0
         previous_loss = -1
         n_batches = len(filenames) // FLAGS.batch
         for e in range(FLAGS.epochs):
@@ -457,13 +457,13 @@ def main():
             
             pbar.close()
             
-            # end training if generator continuously dominates the discriminator
-            if previous_loss == 0. and gan.g_metric_loss.result() == 0.:
-                generator_wins += 1
+            # end training if discriminator continuously dominates the generator
+            if previous_loss == 0. and gan.d_metric_loss.result() == 0.:
+                discriminator_wins += 1
             else:
-                generator_wins = 0
+                discriminator_wins = 0
 
-            if generator_wins >= 15:
+            if discriminator_wins >= 15:
                 break
 
             previous_loss = gan.g_metric_loss.result()
