@@ -16,6 +16,8 @@ import json
 import time
 from sklearn import preprocessing
 from multiprocessing.dummy import Pool as ThreadPool
+import re
+
 
 FLAGS = flags.FLAGS
 
@@ -45,7 +47,7 @@ flags.DEFINE_float('d_lr', 1e-6, 'Learning rate of the discriminator')
 flags.DEFINE_float('dropout', 0.1, 'Dropout rate of the discriminator')
 flags.DEFINE_integer('g_attn', 2, 'Number of multi-head attention layers in the generator')
 flags.DEFINE_integer('d_attn', 4, 'Number of multi-head attention layers in the disciminator')
-flags.DEFINE_float('noise', 0.1, 'Level of noise added to discriminator input data')
+flags.DEFINE_float('noise', 0.05, 'Level of noise added to discriminator input data')
 flags.DEFINE_integer('heads', 8, 'Number of heads in ALL multi-head attention blocks')
 flags.DEFINE_integer('d_model', 768, 'Multi-head attention dimensionality')
 flags.DEFINE_boolean('save_data', False, 'Save all training data to a file that will be loaded into memory')
@@ -312,9 +314,8 @@ class MusicGAN:
         self.d_model = d_model
         self.d_noise = d_noise  # fraction of noise to add to discriminator labels
 
-        self.sgd_rate = 32
-        self.gen_opt = tf.keras.optimizers.Adam(g_lr)
-        self.dis_opt = tf.keras.optimizers.Adam(d_lr)
+        self.gen_opt = tf.keras.optimizers.RMSprop(g_lr)
+        self.dis_opt = tf.keras.optimizers.RMSprop(d_lr)
         self.cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
         self.d_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='dis_loss')
         self.g_metric_loss = tf.keras.metrics.BinaryCrossentropy(name='gen_loss')
@@ -331,6 +332,7 @@ class MusicGAN:
                 seed=FLAGS.seed if FLAGS.seed != -1 else None
                 )
 
+        # 0 -> real; 1 -> fake
         real_loss = self.cross_entropy(
             tf.zeros_like(real_output) + random_noise(real_output),
             real_output)
@@ -341,25 +343,12 @@ class MusicGAN:
         return real_loss + fake_loss
 
     def g_loss(self, fake_output):
-        return self.cross_entropy(tf.zeros_like(fake_output), fake_output)
+        # maximize the log probability the discriminator is incorrect
+        return -1 * self.cross_entropy(tf.ones_like(fake_output), fake_output) 
 
     @tf.function
-    def train_step(self, audio, latent_dim, gradient_offset=2):
+    def train_step(self, audio, latent_dim, train_gen=True):
         noise = tf.random.normal([audio.shape[0], latent_dim])
-
-        for _ in range(gradient_offset - 1):
-            with tf.GradientTape() as gen_tape:
-                generated_audio = self.generator(noise, training=True)
-
-                real_output = self.discriminator(audio, training=False)
-                fake_output = self.discriminator(generated_audio, training=False)
-
-                gen_loss = self.g_loss(fake_output)
-
-                self.g_metric_loss(tf.zeros_like(real_output), fake_output)
-
-            gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
-            self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
         with tf.GradientTape() as gen_tape, tf.GradientTape() as dis_tape:
             generated_audio = self.generator(noise, training=True)
@@ -371,12 +360,13 @@ class MusicGAN:
             gen_loss = self.g_loss(fake_output)
 
             self.d_metric_loss(real_output, fake_output)
-            self.g_metric_loss(tf.zeros_like(real_output), fake_output)
+            self.g_metric_loss(tf.ones_like(real_output), fake_output)
 
         dis_grads = dis_tape.gradient(dis_loss, self.discriminator.trainable_variables)
-        gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
         self.dis_opt.apply_gradients(zip(dis_grads, self.discriminator.trainable_variables))
-        self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
+        if train_gen:
+            gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+            self.gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
     def sample(self, scaler, n=1, fp='.'):
         seed = tf.random.normal([n, FLAGS.latent])
@@ -412,17 +402,23 @@ def main():
                                      discriminator_optimizer=gan.dis_opt,
                                      generator=gan.generator,
                                      discriminator=gan.discriminator)
+    
+    stamp_regex = r"[0-9]+-[0-9]+-[0-9]+_[0-9]+:[0-9]+"
+    epoch_regex = r"[0-9]+$"
+    prev_epochs = 0
     if FLAGS.model_path == '.':
         stamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
-        checkpoint_dir = os.path.join(FLAGS.output_dir, 'checkpoints', 'mgan-spec_' + stamp)
+        checkpoint_dir = os.path.join(FLAGS.output_dir, 'logs', stamp, 'checkpoints')
         manager = tf.train.CheckpointManager(checkpoint, directory=checkpoint_dir, max_to_keep=3)
     else:
-        stamp = FLAGS.model_path[-16:]
+        stamp = re.findall(stamp_regex, FLAGS.model_path)[0]
         manager = tf.train.CheckpointManager(checkpoint, directory=FLAGS.model_path, max_to_keep=3)
+        prev_epochs = max([int(re.findall(epoch_regex, ckpt)[0]) for ckpt in manager.checkpoints if len(re.findall(epoch_regex, ckpt)) > 0])
         checkpoint.restore(manager.latest_checkpoint)
 
     logdir = os.path.join(FLAGS.output_dir, 'logs', stamp)
     grad_logdir = os.path.join(logdir, 'metrics')
+
     if FLAGS.logging:
         graph_writer = tf.summary.create_file_writer(logdir)
         train_summary_writer = tf.summary.create_file_writer(grad_logdir)
@@ -431,6 +427,8 @@ def main():
 
     if FLAGS.train:
         trace = True
+        generator_wins = 0
+        previous_loss = -1
         n_batches = len(filenames) // FLAGS.batch
         for e in range(FLAGS.epochs):
             pbar = tqdm.tqdm(total=n_batches)
@@ -438,7 +436,7 @@ def main():
                 if FLAGS.logging and trace:
                     tf.summary.trace_on(graph=True, profiler=True)
 
-                gan.train_step(batch, FLAGS.latent, gradient_offset=1)
+                gan.train_step(batch, FLAGS.latent)
 
                 # trace graph only once
                 if trace and FLAGS.logging:
@@ -448,19 +446,30 @@ def main():
 
                 if FLAGS.logging:
                     with train_summary_writer.as_default():
-                        tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i + (n_batches * e))
-                        tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i + (n_batches * e))
+                        tf.summary.scalar('gen-loss', gan.g_metric_loss.result(), step=i + (n_batches * (e + prev_epochs)))
+                        tf.summary.scalar('disc-loss', gan.d_metric_loss.result(), step=i + (n_batches * (e + prev_epochs)))
             
                 description = "Epoch: {} | gen loss: {:.4f} | dis loss: {:.4f}".format(e+1, 
                                                                                     gan.g_metric_loss.result(), 
                                                                                     gan.d_metric_loss.result())
                 pbar.set_description(description)
                 pbar.update(1)
+            
+            pbar.close()
+            
+            # end training if generator continuously dominates the discriminator
+            if previous_loss == 0. and gan.g_metric_loss.result() == 0.:
+                generator_wins += 1
+            else:
+                generator_wins = 0
+
+            if generator_wins >= 15:
+                break
+
+            previous_loss = gan.g_metric_loss.result()
 
             if FLAGS.logging:
                 manager.save()
-
-            pbar.close()
 
             gan.g_metric_loss.reset_states()
             gan.d_metric_loss.reset_states()
