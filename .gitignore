@@ -8,3 +8,4 @@ __pycache__/
 *.wav
 logs/
 *.npy
+*.ipynb
