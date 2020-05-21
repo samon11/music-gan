@@ -10,7 +10,7 @@ All audio data was downloaded for free from the [Free Music Archive](https://git
 A list named `filenames` is required to be defined that contains the full or relative paths to the audio files to be trained on. Checkout the TF app command line flags available in [fma-gen.py](fma-gen.py). To train the GAN and create Tensorboard logs for example:
 
 ```bash
-python fma_gen.py --train True --logging True --epochs 200 --seed 198
+python fma-gen.py --train True --logging True --epochs 200 --seed 198
 ```
 
 ## Results
